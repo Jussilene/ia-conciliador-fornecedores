@@ -20,6 +20,82 @@ function getOpenAIClient() {
 }
 
 /**
+ * Normaliza textos para comparação robusta:
+ * - remove acentos
+ * - ignora maiúsculas/minúsculas
+ * - remove quebras de linha e múltiplos espaços
+ * - remove caracteres especiais estranhos vindos do PDF
+ */
+function normalizarTexto(str) {
+  if (!str) return "";
+
+  return String(str)
+    .normalize("NFD") // separa acentos
+    .replace(/[\u0300-\u036f]/g, "") // remove marcas de acento
+    .replace(/[\r\n]+/g, " ") // remove quebras de linha
+    .replace(/\s+/g, " ") // compacta espaços múltiplos em 1
+    .replace(/[^\w\s]/g, " ") // remove pontuação estranha
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Verifica se o fornecedor aparece na razão usando
+ * uma busca mais tolerante (fuzzy por tokens).
+ *
+ * Regras:
+ * - Primeiro tenta match exato no texto normalizado inteiro;
+ * - Depois quebra em linhas e verifica se, em alguma linha,
+ *   pelo menos ~70% das palavras do fornecedor aparecem.
+ */
+function fornecedorExisteNaRazao(nomeFornecedor, textoRazaoBruto) {
+  if (!nomeFornecedor || !textoRazaoBruto) return false;
+
+  const alvo = normalizarTexto(nomeFornecedor);
+  if (!alvo) return false;
+
+  const textoNormalizado = normalizarTexto(textoRazaoBruto);
+
+  // 1) Tentativa simples: substring direta no texto todo
+  if (textoNormalizado.includes(alvo)) {
+    return true;
+  }
+
+  // 2) Tentativa por tokens linha a linha (mais tolerante)
+  const tokensAlvo = alvo
+    .split(" ")
+    .map((t) => t.trim())
+    .filter((t) => t.length > 2); // ignora "de", "sa", "e", etc.
+
+  if (tokensAlvo.length === 0) return false;
+
+  const linhas = String(textoRazaoBruto)
+    .split(/\r?\n/)
+    .map((linha) => normalizarTexto(linha))
+    .filter(Boolean);
+
+  for (const linha of linhas) {
+    let encontrados = 0;
+
+    for (const token of tokensAlvo) {
+      if (linha.includes(token)) {
+        encontrados++;
+      }
+    }
+
+    const score = encontrados / tokensAlvo.length;
+
+    // se encontrou pelo menos 70% das palavras do fornecedor na linha,
+    // consideramos que o fornecedor está presente naquela linha
+    if (score >= 0.7) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Rodada 1: processamento inicial dos arquivos enviados
  * - Lê PDFs / Excel via processFile
  * - Normaliza em um formato padrão
@@ -75,7 +151,67 @@ export async function realizarConciliacao({
     };
   }
 
-  // Monta um resumo compacto dos relatórios para mandar pra IA
+  // 🔹 1) PRIMEIRO: usar o TEXTO COMPLETO da razão para checar se o fornecedor existe
+  const razaoProcessado = relatoriosProcessados?.razao?.processado || {};
+  const razaoTextoCompleto =
+    razaoProcessado.conteudoTexto || razaoProcessado.preview || "";
+
+  const fornecedorEncontrado = fornecedorExisteNaRazao(
+    fornecedor,
+    razaoTextoCompleto
+  );
+
+  if (!fornecedorEncontrado) {
+    // 🚫 Não achou o fornecedor na razão → não chama IA
+    const estruturaJson = {
+      resumoExecutivo: `Não foram encontrados lançamentos do fornecedor "${fornecedor}" na razão enviada.`,
+      composicaoSaldo: [
+        {
+          fonte: "razao",
+          descricao:
+            "Razão de fornecedores analisada, porém o fornecedor informado não consta em nenhum lançamento.",
+          valorEstimado: 0,
+          observacoes:
+            "Verifique se o relatório de razão está filtrado corretamente para o período e empresa, ou se há erro no nome do fornecedor.",
+        },
+      ],
+      divergencias: [
+        {
+          descricao:
+            "Fornecedor informado não aparece em nenhum lançamento da razão de fornecedores.",
+          tipo: "fornecedor_sem_lancamento",
+          referencias: [
+            `Fornecedor: ${fornecedor}`,
+            "Relatório: Razão de Fornecedores",
+          ],
+          nivelCriticidade: "alta",
+        },
+      ],
+      pagamentosOrfaos: [],
+      titulosVencidosSemContrapartida: [],
+      passosRecomendados: [
+        "Conferir se o nome do fornecedor está idêntico ao cadastrado no sistema/contabilidade.",
+        "Validar se o relatório de razão foi emitido para o CNPJ correto e para o período desejado.",
+        "Caso o fornecedor realmente devesse ter lançamentos, solicitar ao responsável a emissão de um novo relatório de razão filtrado corretamente.",
+      ],
+      observacoesGerais:
+        "Como o fornecedor não foi encontrado na amostra do relatório de razão, não é possível prosseguir com a conciliação detalhada até que os relatórios estejam consistentes.",
+    };
+
+    return {
+      fornecedor,
+      simulacao,
+      status: "conciliacao_gerada",
+      modelo: "regra_local_sem_ia",
+      entradaIA: null,
+      estrutura: estruturaJson,
+      respostaBruta:
+        "Fornecedor não encontrado na razão. Diagnóstico gerado sem chamada ao modelo de IA.",
+    };
+  }
+
+  // 🔹 2) Se chegou aqui, o fornecedor EXISTE na razão → montamos o resumo pra IA
+
   const relatoriosResumidos = {};
 
   for (const [chave, info] of Object.entries(relatoriosProcessados || {})) {
@@ -86,7 +222,7 @@ export async function realizarConciliacao({
       tipo: proc?.tipo || null,
       tamanhoTexto: proc?.tamanhoTexto || null,
       preview: proc?.preview || null,
-      // 🔹 Trecho do conteúdo completo (se existir)
+      // 🔹 Aqui sim, usamos só um TRECHO pra não explodir token
       trechoConteudo: proc?.conteudoTexto
         ? String(proc.conteudoTexto).slice(0, 8000)
         : null,
@@ -98,69 +234,7 @@ export async function realizarConciliacao({
     relatorios: relatoriosResumidos,
   };
 
-  // 🔹 REGRA NOVA: checar se o fornecedor aparece na razão
-  const razaoTrecho =
-    relatoriosResumidos?.razao?.trechoConteudo ||
-    relatoriosResumidos?.razao?.preview ||
-    "";
-
-  const fornecedorNormalizado = String(fornecedor).trim().toUpperCase();
-  const razaoNormalizada = String(razaoTrecho).toUpperCase();
-
-  if (fornecedorNormalizado && razaoNormalizada) {
-    const encontrado = razaoNormalizada.includes(fornecedorNormalizado);
-
-    if (!encontrado) {
-      // 🚫 Não achou o fornecedor na razão → não chama IA
-      const estruturaJson = {
-        resumoExecutivo: `Não foram encontrados lançamentos do fornecedor "${fornecedor}" na razão enviada.`,
-        composicaoSaldo: [
-          {
-            fonte: "razao",
-            descricao:
-              "Razão de fornecedores analisada, porém o fornecedor informado não consta em nenhum lançamento.",
-            valorEstimado: 0,
-            observacoes:
-              "Verifique se o relatório de razão está filtrado corretamente para o período e empresa, ou se há erro no nome do fornecedor.",
-          },
-        ],
-        divergencias: [
-          {
-            descricao:
-              "Fornecedor informado não aparece em nenhum lançamento da razão de fornecedores.",
-            tipo: "fornecedor_sem_lancamento",
-            referencias: [
-              `Fornecedor: ${fornecedor}`,
-              "Relatório: Razão de Fornecedores",
-            ],
-            nivelCriticidade: "alta",
-          },
-        ],
-        pagamentosOrfaos: [],
-        titulosVencidosSemContrapartida: [],
-        passosRecomendados: [
-          "Conferir se o nome do fornecedor está idêntico ao cadastrado no sistema/contabilidade.",
-          "Validar se o relatório de razão foi emitido para o CNPJ correto e para o período desejado.",
-          "Caso o fornecedor realmente devesse ter lançamentos, solicitar ao responsável a emissão de um novo relatório de razão filtrado corretamente.",
-        ],
-        observacoesGerais:
-          "Como o fornecedor não foi encontrado na amostra do relatório de razão, não é possível prosseguir com a conciliação detalhada até que os relatórios estejam consistentes.",
-      };
-
-      return {
-        fornecedor,
-        simulacao,
-        status: "conciliacao_gerada",
-        modelo: "regra_local_sem_ia",
-        entradaIA: relatoriosResumidos,
-        estrutura: estruturaJson,
-        respostaBruta:
-          "Fornecedor não encontrado na razão. Diagnóstico gerado sem chamada ao modelo de IA.",
-      };
-    }
-  }
-
-  // 🔹 Se chegou aqui, segue fluxo normal com IA
+  // 🔹 3) Fluxo normal com IA
   const systemPrompt = `
 Você é um analista contábil brasileiro especialista em CONCILIAÇÃO DE FORNECEDORES.
 
