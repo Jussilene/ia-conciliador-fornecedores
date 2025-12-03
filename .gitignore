@@ -15,11 +15,13 @@ pnpm-debug.log*
 logs/
 *.log
 
-# Uploads de arquivos PDF enviados pelo usuário
-uploads/
+# Uploads de arquivos PDF enviados pelo usuário (IGNORA ARQUIVOS, MAS MANTÉM A PASTA)
+uploads/*
+!uploads/.gitkeep
 
-# Arquivos de saída gerados (pdf, txt, excel, json...)
-outputs/
+# Arquivos de saída gerados (IGNORA ARQUIVOS, MAS MANTÉM A PASTA)
+outputs/*
+!outputs/.gitkeep
 
 # Cache
 .cache/
