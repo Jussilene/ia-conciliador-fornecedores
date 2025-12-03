@@ -96,6 +96,167 @@ function fornecedorExisteNaRazao(nomeFornecedor, textoRazaoBruto) {
 }
 
 /**
+ * Extrai linhas do texto bruto onde o fornecedor aparece
+ * (usando a mesma lógica de score de tokens).
+ *
+ * Além disso, captura todos os valores monetários da linha
+ * (padrão 9.999,99) e guarda o último valor encontrado,
+ * que normalmente é o saldo da coluna final.
+ */
+function extrairLinhasFornecedor(textoBruto, nomeFornecedor) {
+  if (!textoBruto || !nomeFornecedor) return [];
+
+  const alvoNorm = normalizarTexto(nomeFornecedor);
+  if (!alvoNorm) return [];
+
+  const tokensAlvo = alvoNorm
+    .split(" ")
+    .map((t) => t.trim())
+    .filter((t) => t.length > 2);
+
+  if (tokensAlvo.length === 0) return [];
+
+  const linhas = String(textoBruto).split(/\r?\n/);
+
+  const resultado = [];
+
+  for (const linhaOriginal of linhas) {
+    const linhaNorm = normalizarTexto(linhaOriginal);
+    if (!linhaNorm) continue;
+
+    let encontrados = 0;
+    for (const token of tokensAlvo) {
+      if (linhaNorm.includes(token)) encontrados++;
+    }
+
+    const score = tokensAlvo.length ? encontrados / tokensAlvo.length : 0;
+
+    // um pouquinho mais tolerante aqui (0.6) para pegar quebra de linha estranha
+    if (score >= 0.6) {
+      const numerosMonetarios = [];
+      const regexValor = /(\d{1,3}(?:\.\d{3})*,\d{2})/g;
+      let m;
+      while ((m = regexValor.exec(linhaOriginal)) !== null) {
+        numerosMonetarios.push(m[1]);
+      }
+
+      resultado.push({
+        linhaOriginal: linhaOriginal.trim(),
+        linhaNormalizada: linhaNorm,
+        scoreMatch: score,
+        numerosMonetarios,
+        ultimoNumero: numerosMonetarios.length
+          ? numerosMonetarios[numerosMonetarios.length - 1]
+          : null,
+      });
+    }
+  }
+
+  return resultado;
+}
+
+/**
+ * Converte string "42.151,99" em número 42151.99
+ */
+function parseValorMonetario(valorStr) {
+  if (!valorStr) return null;
+  const limpo = String(valorStr)
+    .replace(/\./g, "")
+    .replace(/[^\d,-]/g, "")
+    .replace(",", ".");
+  const num = Number.parseFloat(limpo);
+  return Number.isFinite(num) ? num : null;
+}
+
+/**
+ * Monta indicadores objetivos de saldo para o fornecedor
+ * em cada relatório (usando texto COMPLETO, não apenas amostra).
+ *
+ * Isso é usado para:
+ * - dar pistas mais confiáveis para a IA;
+ * - impedir que a IA invente divergência de saldo
+ *   quando os relatórios, na prática, batem.
+ */
+function montarIndicadoresFornecedor(fornecedor, textosPorRelatorio = {}) {
+  const indicadoresFornecedor = {};
+  const saldosNumericosPorRelatorio = {};
+
+  const chavesRelatorios = ["balancete", "contas_pagar", "razao"];
+
+  for (const chave of chavesRelatorios) {
+    const texto = textosPorRelatorio[chave] || "";
+    const linhasFornecedor = extrairLinhasFornecedor(texto, fornecedor);
+
+    const saldosEncontrados = [];
+
+    for (const linha of linhasFornecedor) {
+      if (!linha.ultimoNumero) continue;
+      const valorNum = parseValorMonetario(linha.ultimoNumero);
+      if (valorNum !== null) {
+        saldosEncontrados.push({
+          texto: linha.ultimoNumero,
+          numero: valorNum,
+          linhaOriginal: linha.linhaOriginal,
+        });
+      }
+    }
+
+    if (saldosEncontrados.length > 0) {
+      saldosNumericosPorRelatorio[chave] = saldosEncontrados.map(
+        (s) => s.numero
+      );
+    }
+
+    indicadoresFornecedor[chave] = {
+      linhasFornecedor,
+      saldosEncontrados,
+    };
+  }
+
+  // Avaliação automática simples dos saldos
+  let avaliacaoAutomaticaSaldo = {
+    status: "dados_insuficientes",
+    descricao:
+      "Não foi possível comparar saldos de forma automática com segurança.",
+  };
+
+  const todasChavesComSaldo = Object.keys(saldosNumericosPorRelatorio);
+  if (todasChavesComSaldo.length >= 2) {
+    const todosValores = todasChavesComSaldo.flatMap(
+      (k) => saldosNumericosPorRelatorio[k]
+    );
+
+    const min = Math.min(...todosValores);
+    const max = Math.max(...todosValores);
+
+    if (Number.isFinite(min) && Number.isFinite(max)) {
+      const diff = Math.abs(max - min);
+
+      // Se a diferença máxima for menor ou igual a 0,10
+      // consideramos que são, na prática, o mesmo saldo.
+      if (diff <= 0.1) {
+        avaliacaoAutomaticaSaldo = {
+          status: "saldos_iguais",
+          descricao:
+            "Os saldos identificados automaticamente nos relatórios são praticamente iguais para o fornecedor.",
+          valorReferenciaAproximado: Number(
+            ((min + max) / 2).toFixed(2)
+          ),
+        };
+      } else {
+        avaliacaoAutomaticaSaldo = {
+          status: "saldos_diferentes",
+          descricao:
+            "Foram encontrados saldos numéricos diferentes entre os relatórios para este fornecedor.",
+        };
+      }
+    }
+  }
+
+  return { indicadoresFornecedor, avaliacaoAutomaticaSaldo };
+}
+
+/**
  * Rodada 1: processamento inicial dos arquivos enviados
  * - Lê PDFs / Excel via processFile
  * - Normaliza em um formato padrão
@@ -229,9 +390,23 @@ export async function realizarConciliacao({
     };
   }
 
+  // 🔹 2.1) Textos COMPLETOS para montar indicadores objetivos por relatório
+  const textosCompletos = {
+    razao: razaoTextoCompleto,
+    balancete:
+      relatoriosProcessados?.balancete?.processado?.conteudoTexto || "",
+    contas_pagar:
+      relatoriosProcessados?.contas_pagar?.processado?.conteudoTexto || "",
+  };
+
+  const { indicadoresFornecedor, avaliacaoAutomaticaSaldo } =
+    montarIndicadoresFornecedor(fornecedor, textosCompletos);
+
   const entradaIA = {
     fornecedor,
     relatorios: relatoriosResumidos,
+    indicadoresFornecedor,
+    avaliacaoAutomaticaSaldo,
   };
 
   // 🔹 3) Fluxo normal com IA
@@ -247,13 +422,39 @@ Contexto:
   - preview (primeiras linhas)
   - trechoConteudo (primeira parte do texto real, quando disponível)
 - Os textos originais podem ser muito grandes, então você trabalha com AMOSTRAS.
-- Seu objetivo é AJUDAR o contador a enxergar divergências, composição de saldo e próximos passos.
 
-REGRAS IMPORTANTES:
-- Sempre responda em PORTUGUÊS DO BRASIL.
-- Nunca invente NF ou valores específicos se não estiverem claros nas amostras.
-- Quando os dados forem insuficientes, deixe claro no campo "observacoes".
-- Sua resposta DEVE SER SEMPRE um JSON VÁLIDO e NADA ALÉM DISSO (sem texto fora do JSON).
+Além disso, você recebe um bloco chamado "indicadoresFornecedor" e um campo "avaliacaoAutomaticaSaldo" gerados por REGRAS AUTOMÁTICAS determinísticas:
+
+- "indicadoresFornecedor" contém, para cada relatório (balancete, contas_pagar, razao):
+  - as linhas exatas em que o fornecedor aparece;
+  - todos os valores monetários encontrados na linha;
+  - o último valor monetário (normalmente o saldo).
+- "avaliacaoAutomaticaSaldo" pode ter:
+  - status "saldos_iguais" => os saldos numéricos dos relatórios são praticamente iguais;
+  - status "saldos_diferentes" => foram encontrados saldos diferentes;
+  - status "dados_insuficientes" => não foi possível comparar com segurança.
+
+REGRAS MUITO IMPORTANTES (NÃO DESCUMPRIR):
+
+1) Se "avaliacaoAutomaticaSaldo.status" for "saldos_iguais":
+   - NÃO crie divergência do tipo "saldo_diferente".
+   - Não diga que algum relatório está com saldo zerado se existe saldo identificado nos indicadores.
+   - Deixe claro no "resumoExecutivo" que, em relação ao saldo, os relatórios estão CONSISTENTES para o fornecedor.
+
+2) Se "avaliacaoAutomaticaSaldo.status" for "dados_insuficientes":
+   - NÃO afirme que o saldo de algum relatório é zero só porque você não enxergou o valor na amostra.
+   - Use frases como "não foi possível localizar o saldo na amostra do relatório de contas a pagar" em vez de declarar que o saldo é zerado.
+
+3) Só considere que há "saldo_diferente" quando:
+   - a avaliação automática indicar "saldos_diferentes" OU
+   - você enxergar, nos próprios "indicadoresFornecedor", valores evidentemente divergentes entre os relatórios.
+   Mesmo assim, deixe claro se a conclusão depende de amostras parciais.
+
+4) Nunca invente NF, datas ou valores específicos que não estejam claramente visíveis nas amostras ou nos indicadores.
+
+5) Sempre responda em PORTUGUÊS DO BRASIL.
+
+Sua resposta DEVE SER SEMPRE um JSON VÁLIDO e NADA ALÉM DISSO (sem texto fora do JSON).
 
 ESTRUTURA OBRIGATÓRIA DO JSON:
 
@@ -301,7 +502,7 @@ ESTRUTURA OBRIGATÓRIA DO JSON:
 `;
 
   const userPrompt = `
-Você recebeu um resumo dos relatórios do fornecedor "${fornecedor}".
+Você recebeu um resumo dos relatórios do fornecedor "${fornecedor}", incluindo indicadores numéricos automáticos.
 
 Use esses dados para montar um DIAGNÓSTICO DE CONCILIAÇÃO, apontando:
 - composição de saldo,
@@ -310,7 +511,11 @@ Use esses dados para montar um DIAGNÓSTICO DE CONCILIAÇÃO, apontando:
 - títulos vencidos sem contrapartida,
 - próximos passos.
 
-DADOS DOS RELATÓRIOS (RESUMO + TRECHOS):
+LEMBRE-SE:
+- Respeite rigorosamente as regras sobre "avaliacaoAutomaticaSaldo" descritas na mensagem de sistema.
+- Se os saldos forem considerados iguais pela avaliação automática, NÃO crie divergência de saldo.
+
+DADOS DOS RELATÓRIOS E INDICADORES:
 ${JSON.stringify(entradaIA, null, 2)}
 `;
 
@@ -341,7 +546,7 @@ ${JSON.stringify(entradaIA, null, 2)}
       simulacao,
       status: estruturaJson ? "conciliacao_gerada" : "conciliacao_texto",
       modelo: "gpt-4.1-mini",
-      entradaIA: relatoriosResumidos,
+      entradaIA,
       estrutura: estruturaJson,
       respostaBruta: rawContent,
     };
