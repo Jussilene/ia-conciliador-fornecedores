@@ -176,10 +176,20 @@ function parseValorMonetario(valorStr) {
  * - dar pistas mais confiáveis para a IA;
  * - impedir que a IA invente divergência de saldo
  *   quando os relatórios, na prática, batem.
+ *
+ * 🔹 AJUSTE: na comparação entre relatórios, usamos APENAS
+ * o MAIOR valor identificado em cada relatório (geralmente o saldo final),
+ * em vez de comparar todos os valores linha a linha (NF por NF).
+ *
+ * 🔹 NOVO: calculamos também métricas determinísticas por relatório
+ * (quantidade de valores, soma total e maior valor). Essas métricas
+ * são a “verdade” numérica e a IA deve apenas copiá-las.
  */
 function montarIndicadoresFornecedor(fornecedor, textosPorRelatorio = {}) {
   const indicadoresFornecedor = {};
   const saldosNumericosPorRelatorio = {};
+  const saldosPrincipaisPorRelatorio = {}; // saldo “principal” por relatório
+  const metricasDeterministicas = {};
 
   const chavesRelatorios = ["balancete", "contas_pagar", "razao"];
 
@@ -202,9 +212,22 @@ function montarIndicadoresFornecedor(fornecedor, textosPorRelatorio = {}) {
     }
 
     if (saldosEncontrados.length > 0) {
-      saldosNumericosPorRelatorio[chave] = saldosEncontrados.map(
-        (s) => s.numero
-      );
+      const numeros = saldosEncontrados.map((s) => s.numero);
+      saldosNumericosPorRelatorio[chave] = numeros;
+
+      // saldo principal = MAIOR valor daquele relatório (normalmente o saldo final)
+      const maior = Math.max(...numeros);
+      if (Number.isFinite(maior)) {
+        saldosPrincipaisPorRelatorio[chave] = maior;
+      }
+
+      // métricas determinísticas para este relatório
+      const soma = numeros.reduce((acc, n) => acc + n, 0);
+      metricasDeterministicas[chave] = {
+        quantidadeValores: numeros.length,
+        somaValores: Number(soma.toFixed(2)),
+        maiorValor: Number(maior.toFixed(2)),
+      };
     }
 
     indicadoresFornecedor[chave] = {
@@ -220,14 +243,16 @@ function montarIndicadoresFornecedor(fornecedor, textosPorRelatorio = {}) {
       "Não foi possível comparar saldos de forma automática com segurança.",
   };
 
-  const todasChavesComSaldo = Object.keys(saldosNumericosPorRelatorio);
-  if (todasChavesComSaldo.length >= 2) {
-    const todosValores = todasChavesComSaldo.flatMap(
-      (k) => saldosNumericosPorRelatorio[k]
+  // Agora comparamos apenas os saldos PRINCIPAIS de cada relatório
+  const chavesComSaldoPrincipal = Object.keys(saldosPrincipaisPorRelatorio);
+
+  if (chavesComSaldoPrincipal.length >= 2) {
+    const valoresPrincipais = chavesComSaldoPrincipal.map(
+      (k) => saldosPrincipaisPorRelatorio[k]
     );
 
-    const min = Math.min(...todosValores);
-    const max = Math.max(...todosValores);
+    const min = Math.min(...valoresPrincipais);
+    const max = Math.max(...valoresPrincipais);
 
     if (Number.isFinite(min) && Number.isFinite(max)) {
       const diff = Math.abs(max - min);
@@ -238,22 +263,26 @@ function montarIndicadoresFornecedor(fornecedor, textosPorRelatorio = {}) {
         avaliacaoAutomaticaSaldo = {
           status: "saldos_iguais",
           descricao:
-            "Os saldos identificados automaticamente nos relatórios são praticamente iguais para o fornecedor.",
-          valorReferenciaAproximado: Number(
-            ((min + max) / 2).toFixed(2)
-          ),
+            "Os saldos principais identificados automaticamente nos relatórios são praticamente iguais para o fornecedor.",
+          valorReferenciaAproximado: Number(((min + max) / 2).toFixed(2)),
+          saldosPrincipaisPorRelatorio,
         };
       } else {
         avaliacaoAutomaticaSaldo = {
           status: "saldos_diferentes",
           descricao:
-            "Foram encontrados saldos numéricos diferentes entre os relatórios para este fornecedor.",
+            "Foram encontrados saldos principais diferentes entre os relatórios para este fornecedor.",
+          saldosPrincipaisPorRelatorio,
         };
       }
     }
   }
 
-  return { indicadoresFornecedor, avaliacaoAutomaticaSaldo };
+  return {
+    indicadoresFornecedor,
+    avaliacaoAutomaticaSaldo,
+    metricasDeterministicas,
+  };
 }
 
 /**
@@ -312,7 +341,7 @@ export async function realizarConciliacao({
     };
   }
 
-  // 🔹 1) PRIMEIRO: usar o TEXTO COMPLETO da razão para checar se o fornecedor existe
+  // 1) PRIMEIRO: usar o TEXTO COMPLETO da razão para checar se o fornecedor existe
   const razaoProcessado = relatoriosProcessados?.razao?.processado || {};
   const razaoTextoCompleto =
     razaoProcessado.conteudoTexto || razaoProcessado.preview || "";
@@ -323,7 +352,7 @@ export async function realizarConciliacao({
   );
 
   if (!fornecedorEncontrado) {
-    // 🚫 Não achou o fornecedor na razão → não chama IA
+    // Não achou o fornecedor na razão → não chama IA
     const estruturaJson = {
       resumoExecutivo: `Não foram encontrados lançamentos do fornecedor "${fornecedor}" na razão enviada.`,
       composicaoSaldo: [
@@ -371,7 +400,7 @@ export async function realizarConciliacao({
     };
   }
 
-  // 🔹 2) Se chegou aqui, o fornecedor EXISTE na razão → montamos o resumo pra IA
+  // 2) Se chegou aqui, o fornecedor EXISTE na razão → montamos o resumo pra IA
 
   const relatoriosResumidos = {};
 
@@ -383,14 +412,14 @@ export async function realizarConciliacao({
       tipo: proc?.tipo || null,
       tamanhoTexto: proc?.tamanhoTexto || null,
       preview: proc?.preview || null,
-      // 🔹 Aqui sim, usamos só um TRECHO pra não explodir token
+      // Aqui sim, usamos só um TRECHO pra não explodir token
       trechoConteudo: proc?.conteudoTexto
         ? String(proc.conteudoTexto).slice(0, 8000)
         : null,
     };
   }
 
-  // 🔹 2.1) Textos COMPLETOS para montar indicadores objetivos por relatório
+  // 2.1) Textos COMPLETOS para montar indicadores objetivos por relatório
   const textosCompletos = {
     razao: razaoTextoCompleto,
     balancete:
@@ -399,17 +428,21 @@ export async function realizarConciliacao({
       relatoriosProcessados?.contas_pagar?.processado?.conteudoTexto || "",
   };
 
-  const { indicadoresFornecedor, avaliacaoAutomaticaSaldo } =
-    montarIndicadoresFornecedor(fornecedor, textosCompletos);
+  const {
+    indicadoresFornecedor,
+    avaliacaoAutomaticaSaldo,
+    metricasDeterministicas,
+  } = montarIndicadoresFornecedor(fornecedor, textosCompletos);
 
   const entradaIA = {
     fornecedor,
     relatorios: relatoriosResumidos,
     indicadoresFornecedor,
     avaliacaoAutomaticaSaldo,
+    metricasDeterministicas,
   };
 
-  // 🔹 3) Fluxo normal com IA
+  // 3) Fluxo normal com IA
   const systemPrompt = `
 Você é um analista contábil brasileiro especialista em CONCILIAÇÃO DE FORNECEDORES.
 
@@ -423,16 +456,27 @@ Contexto:
   - trechoConteudo (primeira parte do texto real, quando disponível)
 - Os textos originais podem ser muito grandes, então você trabalha com AMOSTRAS.
 
-Além disso, você recebe um bloco chamado "indicadoresFornecedor" e um campo "avaliacaoAutomaticaSaldo" gerados por REGRAS AUTOMÁTICAS determinísticas:
+Além disso, você recebe três blocos gerados por REGRAS AUTOMÁTICAS determinísticas (sem IA):
 
-- "indicadoresFornecedor" contém, para cada relatório (balancete, contas_pagar, razao):
-  - as linhas exatas em que o fornecedor aparece;
-  - todos os valores monetários encontrados na linha;
-  - o último valor monetário (normalmente o saldo).
-- "avaliacaoAutomaticaSaldo" pode ter:
-  - status "saldos_iguais" => os saldos numéricos dos relatórios são praticamente iguais;
-  - status "saldos_diferentes" => foram encontrados saldos diferentes;
-  - status "dados_insuficientes" => não foi possível comparar com segurança.
+1) "indicadoresFornecedor"
+   - para cada relatório (balancete, contas_pagar, razao):
+     - as linhas exatas em que o fornecedor aparece;
+     - todos os valores monetários encontrados na linha;
+     - o último valor monetário (normalmente o saldo da linha).
+
+2) "avaliacaoAutomaticaSaldo"
+   - pode ter:
+     - status "saldos_iguais" => os saldos numéricos dos RELATÓRIOS (considerando o saldo principal de cada um) são praticamente iguais;
+     - status "saldos_diferentes" => foram encontrados saldos principais diferentes;
+     - status "dados_insuficientes" => não foi possível comparar com segurança.
+
+3) "metricasDeterministicas"
+   - para cada relatório (balancete, contas_pagar, razao), quando houver valores:
+     - quantidadeValores: quantos valores numéricos foram encontrados para o fornecedor;
+     - somaValores: soma EXATA de todos esses valores (já arredondada para 2 casas decimais);
+     - maiorValor: maior valor encontrado (saldo principal).
+   - Esses números são a VERDADE numérica. Você não deve alterá-los nem "recalcular" de outra forma.
+   - Quando precisar usar algum desses valores, copie exatamente o número informado em "somaValores" ou "maiorValor".
 
 REGRAS MUITO IMPORTANTES (NÃO DESCUMPRIR):
 
@@ -445,14 +489,31 @@ REGRAS MUITO IMPORTANTES (NÃO DESCUMPRIR):
    - NÃO afirme que o saldo de algum relatório é zero só porque você não enxergou o valor na amostra.
    - Use frases como "não foi possível localizar o saldo na amostra do relatório de contas a pagar" em vez de declarar que o saldo é zerado.
 
-3) Só considere que há "saldo_diferente" quando:
+3) Sobre "metricasDeterministicas":
+   - Sempre que for falar de SOMA de títulos ou de saldo total em um relatório,
+     use SEMPRE:
+       - metricasDeterministicas[relatorio].somaValores
+         (por exemplo, metricasDeterministicas.contas_pagar.somaValores).
+   - NÃO invente outro número diferente desses.
+   - NÃO arredonde de forma diferente: use o valor exatamente como está.
+
+   Exemplo prático:
+   - Se metricasDeterministicas.contas_pagar.maiorValor = 4272.84,
+     então:
+       - ao descrever "títulos vencidos sem contrapartida" você deve usar um valor nessa ordem de grandeza,
+         e pode copiar exatamente 4272.84 se for o caso.
+
+4) Só considere que há "saldo_diferente" quando:
    - a avaliação automática indicar "saldos_diferentes" OU
    - você enxergar, nos próprios "indicadoresFornecedor", valores evidentemente divergentes entre os relatórios.
    Mesmo assim, deixe claro se a conclusão depende de amostras parciais.
 
-4) Nunca invente NF, datas ou valores específicos que não estejam claramente visíveis nas amostras ou nos indicadores.
+5) NUNCA invente que o saldo de um relatório é "zero" se existirem valores numéricos associados ao fornecedor naquele relatório.
+   Zero só pode ser usado quando fica claro que o saldo é 0 e não há nenhum valor relevante associado ao fornecedor.
 
-5) Sempre responda em PORTUGUÊS DO BRASIL.
+6) Nunca invente NF, datas ou valores específicos que não estejam claramente visíveis nas amostras ou nos indicadores.
+
+7) Sempre responda em PORTUGUÊS DO BRASIL.
 
 Sua resposta DEVE SER SEMPRE um JSON VÁLIDO e NADA ALÉM DISSO (sem texto fora do JSON).
 
@@ -502,7 +563,11 @@ ESTRUTURA OBRIGATÓRIA DO JSON:
 `;
 
   const userPrompt = `
-Você recebeu um resumo dos relatórios do fornecedor "${fornecedor}", incluindo indicadores numéricos automáticos.
+Você recebeu um resumo dos relatórios do fornecedor "${fornecedor}", incluindo:
+
+- "indicadoresFornecedor" (linhas e valores por relatório),
+- "avaliacaoAutomaticaSaldo" (status consolidado dos saldos),
+- "metricasDeterministicas" (métricas numéricas calculadas de forma exata).
 
 Use esses dados para montar um DIAGNÓSTICO DE CONCILIAÇÃO, apontando:
 - composição de saldo,
@@ -514,6 +579,8 @@ Use esses dados para montar um DIAGNÓSTICO DE CONCILIAÇÃO, apontando:
 LEMBRE-SE:
 - Respeite rigorosamente as regras sobre "avaliacaoAutomaticaSaldo" descritas na mensagem de sistema.
 - Se os saldos forem considerados iguais pela avaliação automática, NÃO crie divergência de saldo.
+- Evite concluir "saldo zero" quando há qualquer valor associado ao fornecedor no relatório.
+- Sempre que precisar de somas ou saldos totais por relatório, use os números exatos de "metricasDeterministicas" (sem modificá-los).
 
 DADOS DOS RELATÓRIOS E INDICADORES:
 ${JSON.stringify(entradaIA, null, 2)}
@@ -522,7 +589,7 @@ ${JSON.stringify(entradaIA, null, 2)}
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
-      temperature: 0.1,
+      temperature: 0, // máximo de determinismo possível
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
@@ -539,6 +606,61 @@ ${JSON.stringify(entradaIA, null, 2)}
         "[conciliacao.service] Falha ao fazer parse do JSON da IA. Devolvendo texto bruto.",
         err.message
       );
+    }
+
+    // 🔹 Pós-processamento determinístico dos valores numéricos
+    if (estruturaJson && typeof estruturaJson === "object") {
+      // Ajusta composição de saldo com base nas métricas determinísticas
+      if (Array.isArray(estruturaJson.composicaoSaldo)) {
+        estruturaJson.composicaoSaldo = estruturaJson.composicaoSaldo.map(
+          (linha) => {
+            const nova = { ...linha };
+
+            if (
+              nova.fonte === "balancete" &&
+              metricasDeterministicas?.balancete?.maiorValor != null
+            ) {
+              nova.valorEstimado = metricasDeterministicas.balancete.maiorValor;
+            } else if (
+              nova.fonte === "contas_pagar" &&
+              metricasDeterministicas?.contas_pagar?.maiorValor != null
+            ) {
+              nova.valorEstimado =
+                metricasDeterministicas.contas_pagar.maiorValor;
+            } else if (
+              nova.fonte === "razao" &&
+              metricasDeterministicas?.razao?.maiorValor != null
+            ) {
+              nova.valorEstimado = metricasDeterministicas.razao.maiorValor;
+            }
+
+            return nova;
+          }
+        );
+      }
+
+      // Força o valor de títulos vencidos sem contrapartida para o maiorValor de contas a pagar
+      if (
+        Array.isArray(estruturaJson.titulosVencidosSemContrapartida) &&
+        metricasDeterministicas?.contas_pagar?.maiorValor != null
+      ) {
+        estruturaJson.titulosVencidosSemContrapartida =
+          estruturaJson.titulosVencidosSemContrapartida.map((t) => ({
+            ...t,
+            valorEstimado: metricasDeterministicas.contas_pagar.maiorValor,
+          }));
+      }
+
+      // Se a avaliação automática disser que os saldos são iguais,
+      // removemos qualquer divergência de tipo saldo_diferente
+      if (
+        Array.isArray(estruturaJson.divergencias) &&
+        avaliacaoAutomaticaSaldo?.status === "saldos_iguais"
+      ) {
+        estruturaJson.divergencias = estruturaJson.divergencias.filter(
+          (d) => d.tipo !== "saldo_diferente"
+        );
+      }
     }
 
     return {
